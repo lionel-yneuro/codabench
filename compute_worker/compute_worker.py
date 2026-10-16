@@ -169,7 +169,7 @@ configure_logging(
 )
 
 # -----------------------------------------------
-# Initialize Docker or Podman depending on .env
+# Initialize the configured Docker, Podman or Apptainer backend
 # -----------------------------------------------
 logger.info(
     f"Using {Settings.CONTAINER_ENGINE_EXECUTABLE} "
@@ -181,12 +181,15 @@ if Settings.COMPUTE_WORKER_DISABLE_PREDICTION_UPLOAD:
     Settings.COMPUTE_WORKER_NO_CLEANUP = True
 
 
-# Intializing client
-# NOTE: CONTAINER_SOCKET is set in Settings based on CONTAINER_ENGINE_EXECUTABLE which must has either podman or docker
-client = docker.APIClient(
-    base_url=Settings.CONTAINER_SOCKET,
-    version="auto",
-)
+# Docker/Podman use their configured socket; Apptainer executes local processes.
+if Settings.CONTAINER_ENGINE_EXECUTABLE == "apptainer":
+    from apptainer_backend import APIClient
+    client = APIClient()
+else:
+    client = docker.APIClient(
+        base_url=Settings.CONTAINER_SOCKET,
+        version="auto",
+    )
 
 
 # -----------------------------------------------
@@ -579,6 +582,8 @@ class Run:
             max_retries=Retry(
                 total=3,
                 backoff_factor=1,
+                status_forcelist=[500, 502, 503, 504],
+                allowed_methods=["PATCH", "GET", "PUT"],
             )
         )
         self.requests_session.mount("http://", adapter)
@@ -779,8 +784,10 @@ class Run:
         try:
             self._update_submission(data)
         except Exception as e:
-            # Always catch exception and never raise error
+            # Re-raise only for terminal statuses so Celery marks the task as failed.
             logger.exception(f"Failed to update submission status to {status}: {e}")
+            if status in ("Finished", "Failed"):
+                raise
 
     def _get_container_image(self, image_name):
         logger.info("Running pull for image: {}".format(image_name))
@@ -1085,9 +1092,12 @@ class Run:
                 container, demux=True, stream=True, logs=True
             )
 
-            # If we enter the for loop after the container exited, the program will get stuck
-            # Do not send the real time logs if they are not wanted (Silent Compute Worker)
-            if client.inspect_container(container)["State"]["Status"].lower() == "running":
+            # Preserve Docker/Podman handling; the Apptainer iterator also drains
+            # buffered output after a fast process exit and terminates at EOF.
+            if (
+                Settings.CONTAINER_ENGINE_EXECUTABLE == "apptainer"
+                or client.inspect_container(container)["State"]["Status"].lower() == "running"
+            ):
                 logger.debug(
                     "Show the logs and stream them to codabench " + container.get("Id")
                 )
